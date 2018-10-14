@@ -102,3 +102,6 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+download_newsletter_archives/config.py
+download_newsletter_archives/newsletter_archive_urls.txt
+download_newsletter_archives/ignore_domains.txt

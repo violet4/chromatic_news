@@ -1,0 +1,8 @@
+import logging
+
+logger = None
+default_logging_level = logging.DEBUG
+logging.basicConfig(level=default_logging_level)
+
+connstr = 'postgresql://localhost/chromatic'
+engine = None
