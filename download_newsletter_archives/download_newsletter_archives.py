@@ -34,14 +34,16 @@ from sqlalchemy.ext.declarative import declarative_base
 import requests
 from bs4 import BeautifulSoup
 import newspaper
-
+import pdfminer
 import slate
 
 
 this_dir = dirname(os.path.abspath(__file__))
 sys.path.append(dirname(dirname(this_dir)))
 
-from chromatic_news.dbutils import Base, drop_tables, create_tables, pkey
+from chromatic_news.dbutils import Base, create_tables, pkey
+# from chromatic_news.dbutils import drop_tables
+
 from chromatic_news.download_newsletter_archives.config import (
     connstr, engine, logger, default_logging_level
 )
@@ -62,6 +64,7 @@ SABase = declarative_base(
         schema=schema_name,
     ),
 )
+ignore_domains_file = os.path.join(this_dir, 'ignore_domains.txt')
 
 
 class Counter:
@@ -83,7 +86,7 @@ def timer():
 empty_response = object()
 
 
-def modify_get_request(func, interactive=False):
+def modify_get_request(func, interactive=False, timeout_seconds=10, update_ignore_domains_on_403=False, ignore_domains=[]):
     def new_requests_get(*args, **kwargs):
         url = args[0]
         logging.info('requesting {}'.format(url))
@@ -94,10 +97,31 @@ def modify_get_request(func, interactive=False):
         with timer() as runtime:
             try:
                 Counter.requests_total += 1
-                resp = func(*args, **kwargs)
+                resp = func(*args, timeout=timeout_seconds, **kwargs)
                 Counter.requests_successful += 1
-            except (requests.exceptions.ConnectionError, requests.exceptions.MissingSchema):
+            except requests.exceptions.ReadTimeout:
+                logging.info("requesting '{}' took longer than the {} timeout seconds".format(url, timeout_seconds))
                 return empty_response
+            except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.MissingSchema,
+                    requests.exceptions.SSLError,
+                    requests.exceptions.TooManyRedirects
+            ) as e:
+                print(type(e), e)
+                if interactive:
+                    logging.info(str(e))
+                    input("failed to request '{}'; using empty response ".format(url))
+                return empty_response
+            except Exception as e:
+                print('Unhandled Exception:', type(e), e)
+                raise
+
+        if update_ignore_domains_on_403 and resp.status_code == 403:
+            url_domain = netloc(url)
+            ignore_domains.append(url_domain)
+            with open(ignore_domains_file, 'a') as fa:
+                print(url_domain, file=fa)
 
         total_seconds = runtime['seconds']
         logging.info("requesting '{}' took {:.2f} seconds".format(
@@ -117,7 +141,6 @@ def modify_get_request(func, interactive=False):
 
 def load_ignore_domains():
     ignore_domains = list()
-    ignore_domains_file = os.path.join(this_dir, 'ignore_domains.txt')
     with open(ignore_domains_file, 'r') as fr:
         for line in fr:
             line = line.strip()
@@ -154,7 +177,10 @@ def pdf_bytes_to_content_string(bytes_content):
     bio.seek(0)
     # note that this is a very cpu-intensive
     # line: parsing a pdf.
-    pdf = slate.PDF(bio)
+    try:
+        pdf = slate.PDF(bio)
+    except pdfminer.psparser.PSEOF:
+        return None
     return pdf.text()
 
 
@@ -217,6 +243,7 @@ class Webpage:
             url = self.discovery_url
         if self.full_html is None:
             resp = requests.get(url)
+            self.status = resp.status_code
             self.full_html = resp.content.decode()
             if self.url is None:
                 self.url = resp.url
@@ -230,6 +257,7 @@ class NewsletterArchive(SABase, Base, Webpage):
     nlaid = pkey('nlaid')
     url = Column('url', TEXT)
     full_html = Column('full_html', TEXT)
+    status = Column('status', Integer)
 
     def __str__(self):
         return '{}({})'.format(self.__class__.__name__, repr(self.url))
@@ -272,6 +300,7 @@ class Newsletter(SABase, Base, Webpage):
         resp = requests.get(discovery_url)
 
         self.full_html = resp.content.decode()
+        self.status = resp.status_code
         self.url = resp.url
 
         self.discovery_url = discovery_url
@@ -329,22 +358,29 @@ class Article(SABase, Base, Webpage):
     full_text = Column('full_text', Text)
     full_html = Column('full_html', TEXT)
     title = Column('title', TEXT)
+    status = Column('status', Integer)
 
     nlid = Column('nlid', Integer, ForeignKey('newsletters.nlid'))
     newsletter = relationship('Newsletter', backref='articles')
 
     @staticmethod
-    def __get_url_fulltext_fullhtml_title(url):
+    def __get_url_fulltext_fullhtml_title_statuscode(url):
         resp = requests.get(url)
-        if resp is empty_response:
+        if resp is empty_response or not resp.content:
             return None
 
-        is_pdf = 'application/pdf' in resp.headers['Content-Type']
+        is_pdf = (
+            'Content-Type' in resp.headers
+            and 'application/pdf' in resp.headers['Content-Type']
+        )
 
         if is_pdf:
             level_during = logging.WARNING
             with timer() as runtime, temporary_log_level(level_during, default_logging_level):
                 full_html = full_text = pdf_bytes_to_content_string(resp.content)
+            # pdfminer.psparser.PSEOF
+            if full_html is None:
+                return None
             full_text = full_text.replace(b'\x00'.decode(), '')
             full_html = full_html.replace(b'\x00'.decode(), '')
 
@@ -359,19 +395,22 @@ class Article(SABase, Base, Webpage):
             # to encodings..
             article.download(input_html=resp.content)
             article.parse()
-            full_text = article.text
-            full_html = article.html
-            title = article.title
-        return resp.url, full_text, full_html, title
+            full_text = article.text.replace('\x00', '')
+            full_html = article.html.replace('\x00', '')
+            title = article.title.replace('\x00', '')
+        return resp.url, full_text, full_html, title, resp.status_code
 
-    def __init__(self, sess, discovery_url, newsletter, manual=False):
-        contents = self.__get_url_fulltext_fullhtml_title(discovery_url)
+    @classmethod
+    def create_new_article(cls, sess, discovery_url, newsletter, manual=False):
+        contents = cls.__get_url_fulltext_fullhtml_title_statuscode(discovery_url)
         if contents is None:
             return
-        url, full_text, full_html, title = contents
+        url, full_text, full_html, title, status_code = contents
 
+        self = cls()
         self.nlid = newsletter.nlid
         self.discovery_url = discovery_url
+        self.status = status_code
 
         self.full_text = full_text
         self.url = url
@@ -380,6 +419,7 @@ class Article(SABase, Base, Webpage):
 
         sess.add(self)
         sess.commit()
+        return self
 
     @classmethod
     def ensure_and_get_article(cls, sess, discovery_url, newsletter):
@@ -390,7 +430,9 @@ class Article(SABase, Base, Webpage):
         if articles:
             article = articles[0]
         else:
-            article = cls(sess, discovery_url, newsletter)
+            article = cls.create_new_article(sess, discovery_url, newsletter)
+            if article is None:
+                return None
             sess.add(article)
             sess.commit()
         return article
@@ -461,13 +503,16 @@ def run_main():
     logging.disable(log_level)
     logging.basicConfig(level=log_level)
 
+    ignore_domains = load_ignore_domains()
+
     # modify behavior of requests.get
     requests.get = modify_get_request(
         requests.get,
         interactive=args.interactive,
+        timeout_seconds=args.timeout_seconds,
+        update_ignore_domains_on_403=args.update_ignore_domains_on_403,
+        ignore_domains=ignore_domains,
     )
-
-    ignore_domains = load_ignore_domains()
 
     Base.set_sess(engine)
     # drop_tables(SABase)
@@ -497,9 +542,22 @@ def run_main():
 
                     for i, discovered_article_url in enumerate(filtered_article_urls):
 
-                        article = Article.ensure_and_get_article(sess, discovered_article_url, newsletter)
-                        if verbose:
-                            print(article.title, article.url, '\n')
+                        try:
+                            article = Article.ensure_and_get_article(sess, discovered_article_url, newsletter)
+                        except Exception as e:
+                            if args.debug:
+                                print('Caught Exception:', e)
+                                try:
+                                    import ipdb as pdb
+                                except ImportError:
+                                    import pdb
+                                pdb.set_trace()
+                                article = Article.ensure_and_get_article(sess, discovered_article_url, newsletter)
+                            else:
+                                raise
+
+                        if article and verbose:
+                            print('\n', article.title, article.url)
                         if requests_limit and Counter.requests_total >= requests_limit:
                             stop = True
                             break
@@ -539,6 +597,18 @@ def parse_cl_args():
         help="string or integer, one of: {}".format(
             log_levels,
         ),
+    )
+    argParser.add_argument(
+        '--debug', default=False, action='store_true',
+        help="when fetching an article fails, launch the debugger and retry the fetch",
+    )
+    argParser.add_argument(
+        '--timeout-seconds', default=10, type=int,
+        help="timeout seconds, default %(default)s",
+    )
+    argParser.add_argument(
+        '--update-ignore-domains-on-403', default=False, action='store_true',
+        help="when a url returns a 403 (forbidden), add the domain to the ignore_domains.txt file",
     )
 
     args = argParser.parse_args()
