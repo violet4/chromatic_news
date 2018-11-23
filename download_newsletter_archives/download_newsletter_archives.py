@@ -479,11 +479,12 @@ def read_newsletter_archive_urls(filepath=None):
 
 
 def convert_log_level_to_int(level):
+    if isinstance(level, int) and level % 10 == 0:
+        return level
+
     if level.isnumeric():
         level = int(level)
 
-    if isinstance(level, int) and level % 10 == 0:
-        return level
     elif isinstance(level, str):
         level = level.upper()
         if level in log_level_dict:
@@ -495,6 +496,7 @@ def run_main():
     args = parse_cl_args()
     verbose = args.verbose
     requests_limit = args.requests_limit
+    articles_per_archive = args.articles_per_archive
 
     log_level = convert_log_level_to_int(args.log_level)
     if log_level is None:
@@ -529,11 +531,16 @@ def run_main():
                 if stop:
                     break
 
+                num_articles_downloaded_this_archive = 0
+                finished_this_archive = False
                 newsletter_archive.ensure_full_html_and_bs(sess)
                 newsletter_urls = newsletter_archive.extract_newsletter_urls()
 
                 for newsletter_url in newsletter_urls:
                     if stop:
+                        break
+                    # enforce the articles-per-archive limit
+                    if finished_this_archive:
                         break
 
                     # first filter by site-specific thingies..
@@ -555,6 +562,13 @@ def run_main():
                                 article = Article.ensure_and_get_article(sess, discovered_article_url, newsletter)
                             else:
                                 raise
+
+                        # enforce articles-per-archive limit
+                        if articles_per_archive:
+                            num_articles_downloaded_this_archive += 1
+                            finished_this_archive = num_articles_downloaded_this_archive > articles_per_archive
+                            if finished_this_archive:
+                                break
 
                         if article and verbose:
                             print('\n', article.title, article.url)
@@ -609,6 +623,10 @@ def parse_cl_args():
     argParser.add_argument(
         '--update-ignore-domains-on-403', default=False, action='store_true',
         help="when a url returns a 403 (forbidden), add the domain to the ignore_domains.txt file",
+    )
+    argParser.add_argument(
+        '--articles-per-archive', default=25, type=int,
+        help="download a different number of articles per archive; default %(default)s; use 0 for no limit",
     )
 
     args = argParser.parse_args()
